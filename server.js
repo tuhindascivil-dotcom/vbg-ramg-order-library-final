@@ -1,0 +1,25 @@
+const express=require("express"),session=require("express-session"),bcrypt=require("bcryptjs"),multer=require("multer"),crypto=require("crypto");
+const {createClient}=require("@supabase/supabase-js");
+const app=express(),PORT=process.env.PORT||3000;
+const supabase=createClient(process.env.SUPABASE_URL,process.env.SUPABASE_SERVICE_ROLE_KEY);
+const BUCKET=process.env.SUPABASE_BUCKET||"vbg-ramg-orders";
+app.use(express.json());app.use(express.urlencoded({extended:true}));
+app.use(session({secret:process.env.SESSION_SECRET||"CHANGE_ME",resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:8*60*60*1000}}));
+app.use(express.static("public"));
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:25*1024*1024},fileFilter:(_,f,cb)=>cb(null,f.mimetype==="application/pdf")});
+const cats=["Administrative","Guidelines","Road","Drain","Plantation","Playground","Compound Wall","Flood Protection","Health","Convergence","SECURE","NMMS","Finance / FTO","Technical Specification","MIS / Portal","Meeting","Training","Circular / Memo","Others"];
+const adminOnly=(req,res,next)=>req.session.adminId?next():res.status(401).json({error:"Admin login required"});
+async function init(){await supabase.storage.createBucket(BUCKET,{public:false}).catch(()=>{});let {data:a}=await supabase.from("admins").select("*").limit(1).maybeSingle();if(!a){await supabase.from("admins").insert({username:process.env.ADMIN_USER||"admin",password_hash:bcrypt.hashSync(process.env.ADMIN_PASSWORD||"ChangeMe123!",12)});}let {count}=await supabase.from("categories").select("*",{count:"exact",head:true});if(!count)await supabase.from("categories").insert(cats.map(name=>({name})));}
+app.get("/api/session",(q,s)=>s.json({admin:!!q.session.adminId}));
+app.get("/api/categories",async(q,s)=>{let {data,error}=await supabase.from("categories").select("id,name").order("name");if(error)return s.status(500).json({error:error.message});s.json(data||[])});
+app.get("/api/orders",async(q,s)=>{let x=q.query.q||"",c=q.query.category||"";let z=supabase.from("orders").select("id,title,order_no,order_date,description,original_name,created_at,category:categories(name)").order("created_at",{ascending:false});if(c)z=z.eq("category_id",c);if(x)z=z.or(`title.ilike.%${x}%,order_no.ilike.%${x}%,description.ilike.%${x}%,original_name.ilike.%${x}%`);let {data,error}=await z;if(error)return s.status(500).json({error:error.message});s.json((data||[]).map(o=>({...o,category:o.category?.name||""})))});
+app.get("/api/stats",async(q,s)=>{let {count}=await supabase.from("orders").select("*",{count:"exact",head:true});s.json({total:count||0})});
+app.post("/api/login",async(q,s)=>{let {data:a}=await supabase.from("admins").select("*").eq("username",q.body.username).maybeSingle();if(!a||!bcrypt.compareSync(q.body.password||"",a.password_hash))return s.status(401).json({error:"Invalid username or password"});q.session.adminId=a.id;s.json({ok:true})});
+app.post("/api/logout",(q,s)=>q.session.destroy(()=>s.json({ok:true})));
+app.post("/api/categories",adminOnly,async(q,s)=>{let {data,error}=await supabase.from("categories").insert({name:String(q.body.name||"").trim()}).select().single();if(error)return s.status(409).json({error:"Category already exists"});s.json(data)});
+app.post("/api/orders",adminOnly,upload.single("pdf"),async(q,s)=>{if(!q.file)return s.status(400).json({error:"PDF required"});let path=`${new Date().toISOString().slice(0,10)}/${crypto.randomUUID()}.pdf`;let u=await supabase.storage.from(BUCKET).upload(path,q.file.buffer,{contentType:"application/pdf"});if(u.error)return s.status(500).json({error:u.error.message});let {data,error}=await supabase.from("orders").insert({title:q.body.title,order_no:q.body.order_no||"",order_date:q.body.order_date||null,category_id:q.body.category_id,description:q.body.description||"",storage_path:path,original_name:q.file.originalname}).select().single();if(error){await supabase.storage.from(BUCKET).remove([path]);return s.status(500).json({error:error.message})}s.json({ok:true,id:data.id})});
+async function file(id,download){let {data:o}=await supabase.from("orders").select("*").eq("id",id).single();if(!o)return null;let r=await supabase.storage.from(BUCKET).createSignedUrl(o.storage_path,120,{download:download?o.original_name:false});return r.data?.signedUrl}
+app.get("/api/file/:id",async(q,s)=>{let u=await file(q.params.id,false);u?s.redirect(u):s.status(404).send("Not found")});
+app.get("/api/download/:id",async(q,s)=>{let u=await file(q.params.id,true);u?s.redirect(u):s.status(404).send("Not found")});
+app.delete("/api/orders/:id",adminOnly,async(q,s)=>{let {data:o}=await supabase.from("orders").select("storage_path").eq("id",q.params.id).single();if(!o)return s.status(404).json({error:"Not found"});await supabase.storage.from(BUCKET).remove([o.storage_path]);await supabase.from("orders").delete().eq("id",q.params.id);s.json({ok:true})});
+init().then(()=>app.listen(PORT,()=>console.log("VB-G RAM G library on "+PORT)));
